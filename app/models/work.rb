@@ -63,6 +63,8 @@ class Work < ApplicationRecord
   end
   # moderation
   has_one :moderated_work, dependent: :destroy
+  # imported url
+  has_one :imported_url, dependent: :destroy
 
   ########################################################################
   # VIRTUAL ATTRIBUTES
@@ -165,7 +167,8 @@ class Work < ApplicationRecord
   end
 
   validates :user_defined_tags_count,
-            at_most: { maximum: proc { ArchiveConfig.USER_DEFINED_TAGS_MAX } }
+            at_most: { maximum: proc { ArchiveConfig.USER_DEFINED_TAGS_MAX } },
+            unless: -> { User.current_user.is_a?(Admin) }
 
   # If the recipient doesn't allow gifts, it should not be possible to give them
   # a gift work unless it fulfills a gift exchange assignment or non-anonymous
@@ -245,7 +248,7 @@ class Work < ApplicationRecord
   after_save :notify_of_hiding
 
   after_destroy :expire_caches, :update_pseud_and_collection_indexes
-  after_save :notify_recipients, :expire_caches, :update_pseud_and_collection_indexes, :update_tag_index, :touch_series, :touch_related_works
+  after_save :notify_recipients, :expire_caches, :update_pseud_and_collection_indexes, :update_series_indexes, :update_tag_index, :touch_series, :touch_related_works
 
   before_destroy :send_deleted_work_notification, prepend: true
   def send_deleted_work_notification
@@ -313,6 +316,13 @@ class Work < ApplicationRecord
     pertinent_attributes = %w[id posted restricted in_anon_collection
                               in_unrevealed_collection hidden_by_admin]
     destroyed? || (saved_changes.keys & pertinent_attributes).present?
+  end
+
+  def update_series_indexes
+    return unless should_update_series_indexes?
+
+    series_ids = SerialWork.where(work_id: id).pluck(:series_id)
+    IndexQueue.enqueue_ids(Series, series_ids, :background)
   end
 
   # If the work gets posted, (un)hidden, or (un)revealed, we should (potentially) reindex the tags,
@@ -399,7 +409,7 @@ class Work < ApplicationRecord
 
   def self.find_by_url_cache_key(url)
     url = UrlFormatter.new(url)
-    "/v1/find_by_url/#{Work.find_by_url_generation}/#{url.encoded}"
+    "/v2/find_by_url/#{Work.find_by_url_generation}/#{url.encoded}"
   end
 
   # Match `url` to a work's imported_from_url field using progressively fuzzier matching:
@@ -1113,8 +1123,6 @@ class Work < ApplicationRecord
     user = users.first
     {
       comment_type: "fanwork-post",
-      key: ArchiveConfig.AKISMET_KEY,
-      blog: ArchiveConfig.AKISMET_NAME,
       user_ip: ip_address,
       user_role: "user",
       comment_date_gmt: created_at.to_time.iso8601,
@@ -1130,8 +1138,7 @@ class Work < ApplicationRecord
   end
 
   def check_for_spam
-    return unless %w(staging production).include?(Rails.env)
-    self.spam = Akismetor.spam?(akismet_attributes)
+    self.spam = AkismetClient.spam?(akismet_attributes)
     self.spam_checked_at = Time.now
     save
   end
@@ -1154,15 +1161,13 @@ class Work < ApplicationRecord
   def mark_as_spam!
     update_attribute(:spam, true)
     ModeratedWork.mark_reviewed(self)
-    # don't submit spam reports unless in production mode
-    Rails.env.production? && Akismetor.submit_spam(akismet_attributes)
+    AkismetClient.submit_spam(akismet_attributes)
   end
 
   def mark_as_ham!
     update(spam: false, hidden_by_admin: false)
     ModeratedWork.mark_approved(self)
-    # don't submit ham reports unless in production mode
-    Rails.env.production? && Akismetor.submit_ham(akismet_attributes)
+    AkismetClient.submit_ham(akismet_attributes)
   end
 
   def notify_of_hiding
@@ -1196,26 +1201,44 @@ class Work < ApplicationRecord
   end
 
   def bookmarkable_json
+    # If the work is unrevealed, it should not have any information that can be searched on
+    if unrevealed?
+      return as_json(
+        root: false,
+        bookmarkable_type: "Work",
+        unrevealed: true,
+        bookmarkable_join: { name: "bookmarkable" }
+      ) 
+    end
+
+    methods = %i[collection_ids work_types]
+    %w[general public].each do |visibility|
+      methods << :"#{visibility}_tags"
+      methods << :"#{visibility}_filter_ids"
+
+      Tag::FILTERS.each do |tag_type|
+        methods << :"#{visibility}_#{tag_type.underscore}_ids"
+      end
+    end
+
     as_json(
       root: false,
       only: [
         :title, :summary, :hidden_by_admin, :restricted, :posted,
-        :created_at, :revised_at, :word_count, :complete
+        :created_at, :revised_at, :complete
       ],
-      methods: [
-        :tag, :filter_ids, :rating_ids, :archive_warning_ids, :category_ids,
-        :fandom_ids, :character_ids, :relationship_ids, :freeform_ids,
-        :collection_ids, :work_types
-      ]
+      methods: methods
     ).merge(
       language_id: language&.short,
       anonymous: anonymous?,
       creators: indexed_creators,
       unrevealed: unrevealed?,
-      pseud_ids: anonymous? || unrevealed? ? nil : pseud_ids,
-      user_ids: anonymous? || unrevealed? ? nil : user_ids,
-      bookmarkable_type: 'Work',
-      bookmarkable_join: { name: "bookmarkable" }
+      pseud_ids: anonymous? ? nil : pseud_ids,
+      user_ids: anonymous? ? nil : user_ids,
+      bookmarkable_type: "Work",
+      bookmarkable_join: { name: "bookmarkable" },
+      public_word_count: word_count,
+      general_word_count: word_count
     )
   end
 
@@ -1286,6 +1309,12 @@ class Work < ApplicationRecord
   end
 
   private
+
+  # Visibility or word count has changed, so we need to update series word counts
+  def should_update_series_indexes?
+    pertinent_attributes = %w[id posted restricted word_count hidden_by_admin]
+    (saved_changes.keys & pertinent_attributes).present?
+  end
 
   def challenge_bypass(gift)
     self.challenge_assignments.map(&:requesting_pseud).include?(gift.pseud) ||
