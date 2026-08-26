@@ -71,9 +71,20 @@
   </li>
 
 <%# for author or admin, review comments if moderating them %>
-  <% if (logged_in_as_admin? || (current_user && current_user.is_author_of?(@work))) && @work.find_all_comments.unreviewed_only.exists? %>
+  <% show_unreviewed_link = if logged_in_as_admin?
+                              @work.find_all_comments.unreviewed_only.exists?
+                            elsif current_user && current_user.is_author_of?(@work)
+                              @work.find_all_comments.unreviewed_only.not_spam.exists?
+                            end %>
+
+  <% if show_unreviewed_link %>
+    <% unreviewed_count = if logged_in_as_admin?
+                            @work.find_all_comments.unreviewed_only.count
+                          else
+                            @work.find_all_comments.unreviewed_only.not_spam.count
+                          end %>
     <li class="comments" id="review_comments">
-      <%= link_to ts("Unreviewed Comments") + " (" + @work.find_all_comments.unreviewed_only.count.to_s + ")" , unreviewed_work_comments_path(@work) %>
+      <%= link_to ts("Unreviewed Comments") + " (" + unreviewed_count.to_s + ")", unreviewed_work_comments_path(@work) %>
     </li>
   <% end %>
 
@@ -96,13 +107,6 @@
     </li>
   <% end %>
 
-<%# Personalize Y/N button %>
-  <% if @work.present? %>
-    <li class="personalize">
-      <button id="yn-button" class="button" type="button">Personalize (Y/N)</button>
-    </li>
-  <% end %>
-
   <% if current_user && @subscription %>
     <li class="subscribe">
       <%= render 'subscriptions/form', :subscription => @subscription %>
@@ -120,39 +124,3 @@
     </li>
   <% end %>
 </ul>
-<% if @work.present? %>
-<script type="text/javascript">
-  (function() {
-    const initPersonalization = function() {
-      const btn = document.getElementById('yn-button');
-      if (!btn || btn.dataset.initialized) return;
-
-      btn.addEventListener('click', function(e) {
-        e.preventDefault();
-        let name = prompt("Enter your name:");
-
-        if (name) {
-          name = name.trim();
-          const isAlphanumeric = /^[a-z0-9]+$/i.test(name);
-
-          if (!isAlphanumeric) {
-            alert("Error: Please use only one word with letters or numbers.");
-            return;
-          }
-
-          const workContent = document.querySelector('.userstuff');
-          if (workContent) {
-            const ynRegex = /(?:\(|\[)?y\/n(?:\)|\])?/gi;
-            workContent.innerHTML = workContent.innerHTML.replace(ynRegex, '<strong>' + name + '</strong>');
-          }
-        }
-      });
-      btn.dataset.initialized = "true";
-    };
-
-    document.addEventListener('DOMContentLoaded', initPersonalization)
-    document.addEventListener('page:load', initPersonalization);
-    document.addEventListener('turbolinks:load', initPersonalization);
-  })();
-</script>
-<% end %>
